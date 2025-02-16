@@ -156,7 +156,14 @@ class Trainer(LinearHeadTrainer):
     """
     Adding some functions based on Transformers' Trainer class.
     """
-
+    
+    def __init__(self, *args, **kawargs):
+        super().__init__(*args, **kawargs)
+        self.num_batch_split = self.args.num_batch_split if hasattr(self.args, 'num_batch_split') else 1
+        self.num_copies = self.args.num_copies if hasattr(self.args, 'num_copies') else 1
+        self.sample_steps = self.args.sample_steps if hasattr(self.args, 'sample_steps') else 1
+        
+        
     def create_optimizer_and_scheduler(self, num_training_steps: int):
         """
         Based on Transformers' default one, we add fixing layer option where the bottom n layers' parameters
@@ -396,6 +403,134 @@ class Trainer(LinearHeadTrainer):
         # print("Sample %d zs" % (noise_sample_time))
 
         return noise_sample_time
+    
+    def compute_ref_loss(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model.forward_ref(**inputs)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        return (loss, outputs) if return_outputs else loss
+    
+    
+    def compute_lr_loss(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model.forward_lr(**inputs)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        return (loss, outputs) if return_outputs else loss
+    
+    
+    def training_step_lr(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        # if is_sagemaker_mp_enabled():
+        #     loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+        #     return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        # compute the ref loss
+        with torch.no_grad():
+            ref_loss = self.compute_ref_loss(model, inputs).detach()
+            
+            
+        batch_size, seq_len = inputs['input_ids'].size()
+        chunk_size = batch_size // self.num_batch_split
+        
+        # split the batch into chunks
+        for cinx in range(self.num_batch_split):
+            start = cinx * chunk_size
+            end = (cinx + 1) * chunk_size
+            chunk_inputs = {}
+            chunk_inputs['input_ids'] = inputs['input_ids'][start:end].repeat(self.num_copies, 1)
+            chunk_inputs['attention_mask'] = inputs['attention_mask'][start:end].repeat(self.num_copies, 1)
+            chunk_inputs['labels'] = inputs['labels'][start:end].repeat(self.num_copies)
+            chunk_inputs['ref_loss'] = ref_loss[start:end].repeat(self.num_copies)
+            
+            for sample_step in range(self.sample_steps):
+                loss = self.compute_lr_loss(model, chunk_inputs)
+            
+                if self.args.n_gpu > 1:
+                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+                if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+                    # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+                    loss = loss / (self.args.gradient_accumulation_steps*self.sample_steps*self.num_batch_split)
+
+                if self.do_grad_scaling:
+                    self.scaler.scale(loss).backward()
+                elif self.use_apex:
+                    with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                elif self.deepspeed:
+                    # loss gets scaled under gradient_accumulation_steps in deepspeed
+                    loss = self.deepspeed.backward(loss)
+                else:
+                    loss.backward()
+
+        return loss.detach()
+    
+    
 
     def train(self, model_path=None, dev_objective=None):
         """
@@ -745,6 +880,61 @@ class Trainer(LinearHeadTrainer):
                     # print("%.5f, %.5f" % (loss1.item(), loss2.item()))
                     # print("Loss: %.10f, projected_grad: %.5f" % (loss1, projected_grad))
 
+                
+                elif self.args.forward_learning:
+                    tr_loss += self.training_step_lr(model, inputs)
+
+                    if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
+                        # last step in epoch but step is always smaller than gradient_accumulation_steps
+                        len(epoch_iterator) <= self.args.gradient_accumulation_steps
+                        and (step + 1) == len(epoch_iterator)
+                    ):
+                        if self.args.fp16 and _use_native_amp:
+                            self.scaler.unscale_(optimizer)
+                            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+                        elif self.args.fp16:
+                            norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), self.args.max_grad_norm)
+                        else:
+                            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+
+                        if self.args.optimizer_variant == 'signgd':
+                            for n,p in model.named_parameters():
+                                if p.grad is not None:
+                                    p.grad = torch.sign(p.grad)
+
+                        if transformers.is_torch_tpu_available():
+                            xm.optimizer_step(optimizer)
+                        elif self.args.fp16 and _use_native_amp:
+                            self.scaler.step(optimizer)
+                            self.scaler.update()
+                        else:
+                            optimizer.step()
+
+                        scheduler.step()
+                        model.zero_grad()
+                        self.state.global_step += 1
+                        self.epoch = epoch + (step + 1) / len(epoch_iterator)
+
+                        if (self.args.logging_steps > 0 and self.state.global_step % self.args.logging_steps == 0) or (
+                            self.state.global_step == 1 and self.args.logging_first_step
+                        ):
+                            logs = {}
+                            tr_loss_scalar = tr_loss.item()
+                            logs["loss"] = (tr_loss_scalar - logging_loss_scalar) / self.args.logging_steps
+                            logs["norm"] = norm.item()
+                            # backward compatibility for pytorch schedulers
+                            logs["learning_rate"] = (
+                                scheduler.get_last_lr()[0]
+                                if version.parse(torch.__version__) >= version.parse("1.4")
+                                else scheduler.get_lr()[0]
+                            )
+                            logging_loss_scalar = tr_loss_scalar
+
+                            self.log(logs)
+                            logger.info(str(logs))
+                
+                
+                
                 # standard, non-ZO optimization
                 else:
                     tr_loss += self.training_step(model, inputs)

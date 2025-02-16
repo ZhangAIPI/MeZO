@@ -159,3 +159,4 @@ llm_eval/data
 *.ipynb
 *.output
 *.pdf
+./medium_models/data
